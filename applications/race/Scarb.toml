@@ -1,0 +1,18 @@
+[package]
+name = "race"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+starknet.workspace = true
+snforge_std = "0.35.0"
+erc20 = { path = "../erc20" }
+
+[dev-dependencies]
+cairo_test.workspace = true
+
+[scripts]
+test.workspace = true
+
+[[target.starknet-contract]]
+build-external-contracts = ["erc20::token::erc20"]
