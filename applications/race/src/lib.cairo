@@ -1,28 +1,28 @@
 use starknet::{ContractAddress, get_caller_address, get_block_timestamp, get_contract_address};
 
-#[starknet::interface]
-pub trait IERC20<TContractState> {
-    fn get_name(self: @TContractState) -> felt252;
-    fn get_symbol(self: @TContractState) -> felt252;
-    fn get_decimals(self: @TContractState) -> u8;
-    fn get_total_supply(self: @TContractState) -> felt252;
-    fn balance_of(self: @TContractState, account: ContractAddress) -> felt252;
-    fn allowance(
-        self: @TContractState, owner: ContractAddress, spender: ContractAddress,
-    ) -> felt252;
-    fn transfer(ref self: TContractState, recipient: ContractAddress, amount: felt252);
-    fn transfer_from(
-        ref self: TContractState,
-        sender: ContractAddress,
-        recipient: ContractAddress,
-        amount: felt252,
-    );
-    fn approve(ref self: TContractState, spender: ContractAddress, amount: felt252);
-    fn increase_allowance(ref self: TContractState, spender: ContractAddress, added_value: felt252);
-    fn decrease_allowance(
-        ref self: TContractState, spender: ContractAddress, subtracted_value: felt252,
-    );
-}
+// #[starknet::interface]
+// pub trait IERC20<TContractState> {
+//     fn get_name(self: @TContractState) -> felt252;
+//     fn get_symbol(self: @TContractState) -> felt252;
+//     fn get_decimals(self: @TContractState) -> u8;
+//     fn get_total_supply(self: @TContractState) -> felt252;
+//     fn balance_of(self: @TContractState, account: ContractAddress) -> felt252;
+//     fn allowance(
+//         self: @TContractState, owner: ContractAddress, spender: ContractAddress,
+//     ) -> felt252;
+//     fn transfer(ref self: TContractState, recipient: ContractAddress, amount: felt252);
+//     fn transfer_from(
+//         ref self: TContractState,
+//         sender: ContractAddress,
+//         recipient: ContractAddress,
+//         amount: felt252,
+//     );
+//     fn approve(ref self: TContractState, spender: ContractAddress, amount: felt252);
+//     fn increase_allowance(ref self: TContractState, spender: ContractAddress, added_value: felt252);
+//     fn decrease_allowance(
+//         ref self: TContractState, spender: ContractAddress, subtracted_value: felt252,
+//     );
+// }
 
 
 #[derive(Drop, Copy, Serde, starknet::Store, PartialEq)]
@@ -72,12 +72,16 @@ pub trait IGameContract<TContractState> {
         game_id: u32,
         drone_id: u32
     ) -> u256;
+    fn get_undistributed_rewards(self: @TContractState, game_id: u32) -> u256;
+    fn withdraw_undistributed(ref self: TContractState, game_id: u32, recipient: ContractAddress);
 }
 
 #[starknet::contract]
 mod GameContract {
     use super::{Game, GameStatus, Bet, IGameContract};
-    use erc20::token::{IERC20Dispatcher, IERC20DispatcherTrait};
+    use openzeppelin::token::erc20::interface::{IERC20Dispatcher, IERC20DispatcherTrait};
+
+    // use erc20::token::{IERC20Dispatcher, IERC20DispatcherTrait};
     use starknet::{ContractAddress, get_caller_address, get_block_timestamp, get_contract_address};
     use starknet::storage::{
         Map, StorageMapReadAccess, StorageMapWriteAccess, StoragePointerReadAccess,
@@ -85,12 +89,20 @@ mod GameContract {
     };
 
     const MAX_DRONES: u32 = 12;
-    const MIN_BET: u256 = 1_000000000000000000; // 1 STRK
-    const MAX_BET: u256 = 100_000000000000000000; // 100 STRK
+    const MIN_BET: u256 = 1000000000000000000; // 1 STRK
+    const MAX_BET: u256 = 100000000000000000000; // 100 STRK
     const BETTING_WINDOW: u64 = 30;
-    const FIRST_PLACE_PERCENTAGE: u256 = 50;
-    const SECOND_PLACE_PERCENTAGE: u256 = 30;
-    const THIRD_PLACE_PERCENTAGE: u256 = 20;
+    const FIRST_PLACE_PERCENTAGE: u256 = 50;  // 50% of remaining pool
+    const SECOND_PLACE_PERCENTAGE: u256 = 30; // 30% of remaining pool
+    const THIRD_PLACE_PERCENTAGE: u256 = 15;  // 15% of remaining pool
+
+    // For precision in calculations
+    const BASE_MULTIPLIER: u256 = 1_000;     
+
+    // Maximum win multipliers - reduced for sustainability
+    pub const MAX_WIN_MULTIPLIER_TOP1: u256 = 3_500; // Maximum 3.5x for first place
+    pub const MAX_WIN_MULTIPLIER_TOP2: u256 = 2_500; // Maximum 2.5x for second place
+    pub const MAX_WIN_MULTIPLIER_TOP3: u256 = 1_500; // Maximum 1.5x for third place
 
     #[storage]
     struct Storage {
@@ -98,16 +110,18 @@ mod GameContract {
         token: ContractAddress,
         games: Map<u32, Game>,
         next_game_id: u32,
-        user_bets: Map<(u32, ContractAddress, u32), Bet>, // (game_id, player, drone_id) => Bet
-        drone_total_bets: Map<(u32, u32), u256>, // (game_id, drone_id) => total bets
-        user_drone_count: Map<(u32, ContractAddress), u32>, // (game_id, player) => number of drones bet on
-        drone_user_count: Map<(u32, u32), u32>, // (game_id, drone_id) => number of users
-        drone_users: Map<(u32, u32, u32), ContractAddress>, // (game_id, drone_id, index) -> user address
+        user_bets: Map<(u32, ContractAddress, u32), Bet>,
+        drone_total_bets: Map<(u32, u32), u256>,
+        user_drone_count: Map<(u32, ContractAddress), u32>,
+        drone_user_count: Map<(u32, u32), u32>,
+        drone_users: Map<(u32, u32, u32), ContractAddress>,
+        undistributed_rewards: Map<u32, u256>,
     }
 
     #[constructor]
     fn constructor(ref self: ContractState, admin: ContractAddress, token: ContractAddress) {
         self.admin.write(admin);
+        // self.token.write(token);
         self.token.write(token);
         self.next_game_id.write(0);
     }
@@ -121,7 +135,7 @@ mod GameContract {
         ) -> u32 {
             assert(get_caller_address() == self.admin.read(), 'Not admin');
             assert(total_drones >= 3 && total_drones <= MAX_DRONES, 'Invalid drone count');
-            assert(fee_percentage <= 20, 'Max fee is 20%');
+            assert(fee_percentage <= 5, 'Max fee is 5%');
             
             let game_id = self.next_game_id.read();
             let new_game = Game {
@@ -150,19 +164,28 @@ mod GameContract {
             amount: u256
         ) {
             let mut game = self.games.read(game_id);
-            let current_time = get_block_timestamp();
+            // let current_time = get_block_timestamp();
             let player = get_caller_address();
             
             // Validations
             assert(game.status == GameStatus::OpenForJoin, 'Game not open for betting');
-            assert(current_time <= game.join_end_time, 'Betting window closed');
+            // assert(current_time <= game.join_end_time, 'Betting window closed');
             assert(drone_id < game.total_drones, 'Invalid drone ID');
             assert(amount >= MIN_BET, 'Bet too small');
             assert(amount <= MAX_BET, 'Bet too large');
 
             // Transfer tokens from player
             let token = IERC20Dispatcher { contract_address: self.token.read() };
-            token.transfer_from(player, get_contract_address(), amount.try_into().unwrap());
+            let allowance = token.allowance(get_caller_address(), get_contract_address());
+            let allowance_u256: u256 = allowance.into();
+            assert(allowance_u256 >= amount, 'Insufficient allowance');
+
+            let is_transfer_success = token.transfer_from(
+                get_caller_address(),
+                get_contract_address(),
+                amount
+            );
+            assert(is_transfer_success, 'Transfer failed');
 
             // Update or create bet
             let existing_bet = self.user_bets.read((game_id, player, drone_id));
@@ -207,41 +230,74 @@ mod GameContract {
             assert(third < game.total_drones, 'Invalid third place');
             assert(first != second && first != third && second != third, 'Duplicate winners');
 
-            // Calculate protocol fee and remaining pool
-            let protocol_fee = (game.total_deposits * game.fee_percentage) / 100;
-            let remaining_pool = game.total_deposits - protocol_fee;
+            // Calculate protocol fee first
+            let protocol_fee = if game.total_deposits > 0 {
+                (game.total_deposits * game.fee_percentage) / 100
+            } else {
+                0
+            };
 
-            // Update game state
+            // Ensure we have enough balance for fee
+            assert(game.total_deposits >= protocol_fee, 'Insufficient balance for fee');
+
+            // Calculate remaining pool safely
+            let remaining_pool = game.total_deposits - protocol_fee;
+            assert(remaining_pool <= game.total_deposits, 'Pool calculation overflow');
+
+            // Update game state before transfers
+            game.status = GameStatus::Completed;
             game.protocol_fee = protocol_fee;
             game.first_place = first;
             game.second_place = second;
             game.third_place = third;
-            game.status = GameStatus::Completed;
             self.games.write(game_id, game);
 
-            // Transfer protocol fee to admin
-            let token = IERC20Dispatcher { contract_address: self.token.read() };
-            token.transfer(self.admin.read(), protocol_fee.try_into().unwrap());
+            // Only transfer protocol fee if it's greater than 0
+            if protocol_fee > 0 {
+                let token = IERC20Dispatcher { contract_address: self.token.read() };
+                token.transfer(self.admin.read(), protocol_fee.try_into().unwrap());
+            }
 
-            // Calculate and distribute rewards for first place
-            let first_pool = (remaining_pool * FIRST_PLACE_PERCENTAGE) / 100;
+            // Calculate prize pools safely
+            let first_pool = if remaining_pool > 0 {
+                (remaining_pool * FIRST_PLACE_PERCENTAGE) / 100
+            } else {
+                0
+            };
+
+            let second_pool = if remaining_pool > 0 {
+                (remaining_pool * SECOND_PLACE_PERCENTAGE) / 100
+            } else {
+                0
+            };
+
+            let third_pool = if remaining_pool > 0 {
+                (remaining_pool * THIRD_PLACE_PERCENTAGE) / 100
+            } else {
+                0
+            };
+
+            // Distribute rewards only if there are bets
             let first_total_bets = self.drone_total_bets.read((game_id, first));
-            if first_total_bets > 0 {
+            if first_total_bets > 0 && first_pool > 0 {
                 self.distribute_rewards(game_id, first, first_pool);
             }
 
-            // Calculate and distribute rewards for second place
-            let second_pool = (remaining_pool * SECOND_PLACE_PERCENTAGE) / 100;
             let second_total_bets = self.drone_total_bets.read((game_id, second));
-            if second_total_bets > 0 {
+            if second_total_bets > 0 && second_pool > 0 {
                 self.distribute_rewards(game_id, second, second_pool);
             }
 
-            // Calculate and distribute rewards for third place
-            let third_pool = (remaining_pool * THIRD_PLACE_PERCENTAGE) / 100;
             let third_total_bets = self.drone_total_bets.read((game_id, third));
-            if third_total_bets > 0 {
+            if third_total_bets > 0 && third_pool > 0 {
                 self.distribute_rewards(game_id, third, third_pool);
+            }
+
+            // Store any undistributed rewards
+            let total_distributed = first_pool + second_pool + third_pool;
+            let undistributed = remaining_pool - total_distributed;
+            if undistributed > 0 {
+                self.undistributed_rewards.write(game_id, undistributed);
             }
         }
 
@@ -265,6 +321,30 @@ mod GameContract {
         ) -> u256 {
             self.drone_total_bets.read((game_id, drone_id))
         }
+
+        fn get_undistributed_rewards(self: @ContractState, game_id: u32) -> u256 {
+            self.undistributed_rewards.read(game_id)
+        }
+
+        fn withdraw_undistributed(
+            ref self: ContractState,
+            game_id: u32,
+            recipient: ContractAddress
+        ) {
+            // Only admin can withdraw
+            assert(get_caller_address() == self.admin.read(), 'Not admin');
+            
+            // Get undistributed amount
+            let undistributed = self.undistributed_rewards.read(game_id);
+            assert(undistributed > 0, 'No undistributed rewards');
+            
+            // Reset undistributed amount
+            self.undistributed_rewards.write(game_id, 0);
+            
+            // Transfer to recipient
+            let token = IERC20Dispatcher { contract_address: self.token.read() };
+            token.transfer(recipient, undistributed);
+        }
     }
 
     #[generate_trait]
@@ -278,7 +358,18 @@ mod GameContract {
             let token = IERC20Dispatcher { contract_address: self.token.read() };
             let total_drone_bets = self.drone_total_bets.read((game_id, drone_id));
             let total_users = self.drone_user_count.read((game_id, drone_id));
+            let game = self.games.read(game_id);
 
+            // Get max multiplier based on position
+            let max_multiplier = if drone_id == game.first_place {
+                MAX_WIN_MULTIPLIER_TOP1
+            } else if drone_id == game.second_place {
+                MAX_WIN_MULTIPLIER_TOP2
+            } else {
+                MAX_WIN_MULTIPLIER_TOP3
+            };
+
+            let mut total_undistributed: u256 = 0;
             let mut i: u32 = 0;
             loop {
                 if i >= total_users {
@@ -289,14 +380,32 @@ mod GameContract {
                 let bet = self.user_bets.read((game_id, user, drone_id));
                 
                 if bet.amount > 0 {
-                    let user_reward = (pool * bet.amount) / total_drone_bets;
-                    if user_reward > 0 {
-                        token.transfer(user, user_reward.try_into().unwrap());
+                    let reward = (pool * bet.amount) / total_drone_bets;
+                    let max_win = (bet.amount * (max_multiplier - BASE_MULTIPLIER)) / BASE_MULTIPLIER;
+                    
+                    let final_reward = if reward > max_win {
+                        max_win
+                    } else {
+                        reward
+                    };
+                    
+                    // Track undistributed amount
+                    if reward > max_win {
+                        total_undistributed += (reward - max_win);
+                    }
+                    
+                    if final_reward > 0 {
+                        let return_amount = bet.amount + final_reward;
+                        token.transfer(user, return_amount);
                     }
                 }
                 
                 i += 1;
-            }
+            };
+
+            // Store undistributed amount for this game
+            let current_undistributed = self.undistributed_rewards.read(game_id);
+            self.undistributed_rewards.write(game_id, current_undistributed + total_undistributed);
         }
     }
 }
@@ -324,6 +433,11 @@ mod tests {
 
     const ADMIN: felt252 = 0x123;
     const PLAYER: felt252 = 0x456;
+    const PLAYER1: felt252 = 0x457;
+    const PLAYER2: felt252 = 0x789;
+    const PLAYER3: felt252 = 0xabc;
+    const PLAYER4: felt252 = 0xdef;
+    const PLAYER5: felt252 = 0x111;
 
     const token_name: felt252 = 'starknet';
     const decimals: u8 = 18;
@@ -587,7 +701,7 @@ mod tests {
     //     assert(game.total_deposits == 5_000000000000000000, 'Invalid total deposits');
     // }
 
-    #[test]
+   #[test]
     fn test_full_game_flow() {
         let (race_contract, race_address, token, token_address) = deploy_contract();
         let admin = contract_address_const::<ADMIN>();
@@ -610,7 +724,7 @@ mod tests {
 
         // Create game with 8 drones and 3% fee
         start_cheat_caller_address(race_address, admin);
-        let game_id = race_contract.create_game(8, 20);
+        let game_id = race_contract.create_game(8, 5);
         stop_cheat_caller_address(race_address);
 
         // Verify admin balance hasn't changed after creating game
@@ -625,14 +739,14 @@ mod tests {
         players.append(contract_address_const::<0x1234>());
         players.append(contract_address_const::<0x1235>());
         players.append(contract_address_const::<0x1236>());
-        // players.append(contract_address_const::<0x1237>());
-        // players.append(contract_address_const::<0x1238>());
-        // players.append(contract_address_const::<0x1239>());
-        // players.append(contract_address_const::<0x123A>());
-        // players.append(contract_address_const::<0x123B>());
-        // players.append(contract_address_const::<0x123C>());
-        // players.append(contract_address_const::<0x123D>());
-        // players.append(contract_address_const::<0x123E>());
+        players.append(contract_address_const::<0x1237>());
+        players.append(contract_address_const::<0x1238>());
+        players.append(contract_address_const::<0x1239>());
+        players.append(contract_address_const::<0x123A>());
+        players.append(contract_address_const::<0x123B>());
+        players.append(contract_address_const::<0x123C>());
+        players.append(contract_address_const::<0x123D>());
+        players.append(contract_address_const::<0x123E>());
         // players.append(contract_address_const::<0x123F>());
         // players.append(contract_address_const::<0x1240>());
         // players.append(contract_address_const::<0x1241>());
@@ -770,169 +884,210 @@ mod tests {
             // let (initial_balance, post_bet, final_bal, _) = *player_balance_tracking.at(i.try_into().unwrap());
             let final_balance = token.balance_of(player);
             
-            println!("\nPlayer {} results:", i);
+            // println!("\nPlayer {} results:", i);
             let mut total_bet_amount: u256 = 0;
-            let mut total_earn_amount: u256 = 0;
-            let mut total_lost_amount: u256 = 0;
+            // let mut total_earn_amount: u256 = 0;
+            // let mut total_lost_amount: u256 = 0;
             
             // Show initial balance
-            // let (init_whole, init_decimal) = format_balance(token.balance_of(player));
-            // println!("Balance before betting: {}.{} STRK", init_whole, init_decimal);
+            // let (init_whole, init_decimal) = format_balance(1000_000000000000000000_u256.try_into().unwrap());
+            // println!("Initial:     {}.{} STRK", init_whole, init_decimal);
             
             // Check bets on each drone
             let mut drone_id: u32 = 0;
+            // loop {
+            //     if drone_id >= 8 {
+            //         break;
+            //     }
+            //     let bet = race_contract.get_user_bet(game_id, player, drone_id);
+            //     if bet.amount != 0 {
+            //         let (amount_whole, amount_decimal) = format_balance(bet.amount.try_into().unwrap());
+            //         total_bet_amount += bet.amount;
+                    
+            //         if drone_id == final_game.first_place {
+            //             // Calculate share of first place pool (50% of remaining pool)
+            //             let first_place_pool = (final_game.total_deposits - final_game.protocol_fee) * 50 / 100;
+            //             let drone_total_bets = race_contract.get_drone_total_bets(game_id, drone_id);
+            //             let reward = (bet.amount * first_place_pool) / drone_total_bets;
+            //             total_earn_amount += reward;
+            //             let (reward_whole, reward_decimal) = format_balance(reward.try_into().unwrap());
+            //             println!("WIN on drone {}: Bet {}.{} STRK => Earned +{}.{} STRK (50% pool)", 
+            //                 drone_id, amount_whole, amount_decimal,
+            //                 reward_whole, reward_decimal
+            //             );
+            //         } else if drone_id == final_game.second_place {
+            //             // Calculate share of second place pool (30% of remaining pool)
+            //             let second_place_pool = (final_game.total_deposits - final_game.protocol_fee) * 30 / 100;
+            //             let drone_total_bets = race_contract.get_drone_total_bets(game_id, drone_id);
+            //             let reward = (bet.amount * second_place_pool) / drone_total_bets;
+            //             total_earn_amount += reward;
+            //             let (reward_whole, reward_decimal) = format_balance(reward.try_into().unwrap());
+            //             println!("WIN on drone {}: Bet {}.{} STRK => Earned +{}.{} STRK (30% pool)", 
+            //                 drone_id, amount_whole, amount_decimal,
+            //                 reward_whole, reward_decimal
+            //             );
+            //         } else if drone_id == final_game.third_place {
+            //             // Calculate share of third place pool (20% of remaining pool)
+            //             let third_place_pool = (final_game.total_deposits - final_game.protocol_fee) * 20 / 100;
+            //             let drone_total_bets = race_contract.get_drone_total_bets(game_id, drone_id);
+            //             let reward = (bet.amount * third_place_pool) / drone_total_bets;
+            //             total_earn_amount += reward;
+            //             let (reward_whole, reward_decimal) = format_balance(reward.try_into().unwrap());
+            //             println!("WIN on drone {}: Bet {}.{} STRK => Earned +{}.{} STRK (20% pool)", 
+            //                 drone_id, amount_whole, amount_decimal,
+            //                 reward_whole, reward_decimal
+            //             );
+            //         } else {
+            //             total_lost_amount += bet.amount;
+            //             println!("LOST on drone {}: -{}.{} STRK", drone_id, amount_whole, amount_decimal);
+            //         }
+            //     }
+            //     drone_id += 1;
+            // };
+            
+            // // Show summary
+            // let (bet_whole, bet_decimal) = format_balance(total_bet_amount.try_into().unwrap());
+            // let (earn_whole, earn_decimal) = format_balance(total_earn_amount.try_into().unwrap());
+            // let (final_whole, final_decimal) = format_balance(final_balance);
+            
+            // // let initial_balance = 1000_000000000000000000_u256; // 1000 STRK
+            // // let expected_balance = initial_balance + total_earn_amount - total_lost_amount;
+            // // let (expected_whole, expected_decimal) = format_balance(expected_balance.try_into().unwrap());
+            
+            // println!("Total bet: {}.{} STRK", bet_whole, bet_decimal);
+            // println!("Total earned: +{}.{} STRK", earn_whole, earn_decimal);
+            // println!("Final balance: {}.{} STRK", final_whole, final_decimal);
+            // let result_balance = token.balance_of(player);
+            // let (result_whole, result_decimal) = format_balance(result_balance);
+            // println!("Post bet balance: {}.{} STRK", result_whole, result_decimal);
+
+            // println!("Post bet balance: {}.{} STRK", format_balance(result_balance));
+            // println!("Expected balance: {}.{} STRK", expected_whole, expected_decimal);
+            // assert(final_balance == expected_balance.try_into().unwrap(), 'Wrong final balance');
+
+            println!("\nPlayer {} Balance Breakdown:", i);
+            
+            // Initial balance and total bets
+            let (init_whole, init_decimal) = format_balance(1000_000000000000000000_u256.try_into().unwrap());
+            println!("  Initial:     {}.{} STRK", init_whole, init_decimal);
+            let (bet_whole, bet_decimal) = format_balance(total_bet_amount.try_into().unwrap());
+            println!("  Bets:        -{}.{} STRK", bet_whole, bet_decimal);
+            let (after_whole, after_decimal) = format_balance((1000_000000000000000000_u256 - total_bet_amount).try_into().unwrap());
+            println!("  After bets:   {}.{} STRK", after_whole, after_decimal);
+
+             // Show winning bets returned
+            println!("\n    Winning bets returned:");
+            drone_id = 0;
             loop {
                 if drone_id >= 8 {
                     break;
                 }
                 let bet = race_contract.get_user_bet(game_id, player, drone_id);
-                if bet.amount != 0 {
-                    let (amount_whole, amount_decimal) = format_balance(bet.amount.try_into().unwrap());
-                    total_bet_amount += bet.amount;
-                    
-                    if drone_id == final_game.first_place {
-                        // Calculate share of first place pool (50% of remaining pool)
-                        let first_place_pool = (final_game.total_deposits - final_game.protocol_fee) * 50 / 100;
-                        let drone_total_bets = race_contract.get_drone_total_bets(game_id, drone_id);
-                        let reward = (bet.amount * first_place_pool) / drone_total_bets;
-                        total_earn_amount += reward;
-                        let (reward_whole, reward_decimal) = format_balance(reward.try_into().unwrap());
-                        println!("WIN on drone {}: Bet {}.{} STRK => Earned +{}.{} STRK (50% pool)", 
-                            drone_id, amount_whole, amount_decimal,
-                            reward_whole, reward_decimal
-                        );
-                    } else if drone_id == final_game.second_place {
-                        // Calculate share of second place pool (30% of remaining pool)
-                        let second_place_pool = (final_game.total_deposits - final_game.protocol_fee) * 30 / 100;
-                        let drone_total_bets = race_contract.get_drone_total_bets(game_id, drone_id);
-                        let reward = (bet.amount * second_place_pool) / drone_total_bets;
-                        total_earn_amount += reward;
-                        let (reward_whole, reward_decimal) = format_balance(reward.try_into().unwrap());
-                        println!("WIN on drone {}: Bet {}.{} STRK => Earned +{}.{} STRK (30% pool)", 
-                            drone_id, amount_whole, amount_decimal,
-                            reward_whole, reward_decimal
-                        );
-                    } else if drone_id == final_game.third_place {
-                        // Calculate share of third place pool (20% of remaining pool)
-                        let third_place_pool = (final_game.total_deposits - final_game.protocol_fee) * 20 / 100;
-                        let drone_total_bets = race_contract.get_drone_total_bets(game_id, drone_id);
-                        let reward = (bet.amount * third_place_pool) / drone_total_bets;
-                        total_earn_amount += reward;
-                        let (reward_whole, reward_decimal) = format_balance(reward.try_into().unwrap());
-                        println!("WIN on drone {}: Bet {}.{} STRK => Earned +{}.{} STRK (20% pool)", 
-                            drone_id, amount_whole, amount_decimal,
-                            reward_whole, reward_decimal
-                        );
+                if bet.amount > 0 {
+                    if drone_id == final_game.first_place || 
+                       drone_id == final_game.second_place || 
+                       drone_id == final_game.third_place {
+                        let (bet_whole, bet_decimal) = format_balance(bet.amount.try_into().unwrap());
+                        println!("      - Drone {}:     +{}.{} STRK (original bet)", drone_id, bet_whole, bet_decimal);
                     } else {
-                        total_lost_amount += bet.amount;
-                        println!("LOST on drone {}: -{}.{} STRK", drone_id, amount_whole, amount_decimal);
+                        let (bet_whole, bet_decimal) = format_balance(bet.amount.try_into().unwrap());
+                        println!("      - Lost bet:      -{}.{} STRK (drone {})", bet_whole, bet_decimal, drone_id);
                     }
                 }
                 drone_id += 1;
             };
-            
-            // Show summary
-            let (bet_whole, bet_decimal) = format_balance(total_bet_amount.try_into().unwrap());
-            let (earn_whole, earn_decimal) = format_balance(total_earn_amount.try_into().unwrap());
-            // let (lost_whole, lost_decimal) = format_balance(total_lost_amount.try_into().unwrap());
+
+             // Show extra winnings
+            println!("\n    Extra winnings:");
+            drone_id = 0;
+            loop {
+                if drone_id >= 8 {
+                    break;
+                }
+                let bet = race_contract.get_user_bet(game_id, player, drone_id);
+                if bet.amount > 0 {
+                    if drone_id == final_game.first_place {
+                        let first_pool = (final_game.total_deposits - final_game.protocol_fee) * 50 / 100;
+                        let drone_total_bets = race_contract.get_drone_total_bets(game_id, drone_id);
+                        let reward = (bet.amount * first_pool) / drone_total_bets;
+                        let (reward_whole, reward_decimal) = format_balance(reward.try_into().unwrap());
+                        println!("      - Drone {}:     +{}.{} STRK", drone_id, reward_whole, reward_decimal);
+                    } else if drone_id == final_game.second_place {
+                        let second_pool = (final_game.total_deposits - final_game.protocol_fee) * 30 / 100;
+                        let drone_total_bets = race_contract.get_drone_total_bets(game_id, drone_id);
+                        let reward = (bet.amount * second_pool) / drone_total_bets;
+                        let (reward_whole, reward_decimal) = format_balance(reward.try_into().unwrap());
+                        println!("      - Drone {}:     +{}.{} STRK", drone_id, reward_whole, reward_decimal);
+                    } else if drone_id == final_game.third_place {
+                        let third_pool = (final_game.total_deposits - final_game.protocol_fee) * 20 / 100;
+                        let drone_total_bets = race_contract.get_drone_total_bets(game_id, drone_id);
+                        let reward = (bet.amount * third_pool) / drone_total_bets;
+                        let (reward_whole, reward_decimal) = format_balance(reward.try_into().unwrap());
+                        println!("      - Drone {}:     +{}.{} STRK", drone_id, reward_whole, reward_decimal);
+                    }
+                }
+                drone_id += 1;
+            };
+
+            // Show final balance
             let (final_whole, final_decimal) = format_balance(final_balance);
-            
-            // println!("\nSummary:");
-            println!("Total bet: {}.{} STRK", bet_whole, bet_decimal);
-            println!("Total earned: +{}.{} STRK", earn_whole, earn_decimal);
-            // println!("Total lost: -{}.{} STRK", lost_whole, lost_decimal);
-            println!("Balance after game: {}.{} STRK", final_whole, final_decimal);
+            println!("\n    Final:       {}.{} STRK", final_whole, final_decimal);
             
             i += 1;
         };
 
-        let (pool_whole, pool_decimal) = format_balance(final_game.total_deposits.try_into().unwrap());
-        let (fee_whole, fee_decimal) = format_balance(final_game.protocol_fee.try_into().unwrap());
-        println!("\nGame Summary:");
-        println!("Total Pool: {}.{} STRK", pool_whole, pool_decimal);
-        println!("Protocol Fee: {}.{} STRK", fee_whole, fee_decimal);
-
-        // Add game overview at the start
-        println!("\n=== Game Overview ===");
-        println!("Total players: {}", players.len());
-        println!("Protocol fee: 3%");
-        println!("Total drones: 8");
-
-        // Add detailed pool distribution after player results
+        // Log undistributed rewards
+        let undistributed_rewards = race_contract.get_undistributed_rewards(game_id);
+        let (undist_whole, undist_decimal) = format_balance(undistributed_rewards.try_into().unwrap());
         println!("\n=== Pool Distribution ===");
-        let remaining_pool = final_game.total_deposits - final_game.protocol_fee;
+        
+        // Calculate and log total pool and remaining pool
+        let total_pool = final_game.total_deposits;
+        let remaining_pool = total_pool - final_game.protocol_fee;
+        let (total_whole, total_decimal) = format_balance(total_pool.try_into().unwrap());
         let (remain_whole, remain_decimal) = format_balance(remaining_pool.try_into().unwrap());
-        println!("Total pool: {}.{} STRK", pool_whole, pool_decimal);
+        
+        println!("Total pool: {}.{} STRK", total_whole, total_decimal);
+        println!("Remaining pool: {}.{} STRK", remain_whole, remain_decimal);
+        println!("Undistributed rewards: {}.{} STRK", undist_whole, undist_decimal);
+
+        // Log pool distribution details
+        println!("\n=== Pool Distribution Details ===");
+        
+        // Total pool and protocol fee
+        let total_pool = final_game.total_deposits;
+        let protocol_fee = final_game.protocol_fee;
+        let remaining_pool = total_pool - protocol_fee;
+        
+        let (total_whole, total_decimal) = format_balance(total_pool.try_into().unwrap());
+        let (fee_whole, fee_decimal) = format_balance(protocol_fee.try_into().unwrap());
+        let (remain_whole, remain_decimal) = format_balance(remaining_pool.try_into().unwrap());
+        
+        println!("Total pool: {}.{} STRK", total_whole, total_decimal);
         println!("Protocol fee (3%): {}.{} STRK", fee_whole, fee_decimal);
         println!("Remaining pool: {}.{} STRK", remain_whole, remain_decimal);
-
-        // Show prize distribution
+        
+        // Prize pools
+        let first_pool = (remaining_pool * 50) / 100;
+        let second_pool = (remaining_pool * 30) / 100;
+        let third_pool = (remaining_pool * 20) / 100;
+        
         println!("\nPrize Distribution:");
-        let first_pool = remaining_pool * 50 / 100;
-        let second_pool = remaining_pool * 30 / 100;
-        let third_pool = remaining_pool * 20 / 100;
         let (first_whole, first_decimal) = format_balance(first_pool.try_into().unwrap());
         let (second_whole, second_decimal) = format_balance(second_pool.try_into().unwrap());
         let (third_whole, third_decimal) = format_balance(third_pool.try_into().unwrap());
-        println!("1st place (Drone {}): {}.{} STRK (50%)", final_game.first_place, first_whole, first_decimal);
-        println!("2nd place (Drone {}): {}.{} STRK (30%)", final_game.second_place, second_whole, second_decimal);
-        println!("3rd place (Drone {}): {}.{} STRK (20%)", final_game.third_place, third_whole, third_decimal);
-
-        // Show total bets per drone
-        println!("\nTotal Bets per Drone:");
-        let mut drone_id: u32 = 0;
-        loop {
-            if drone_id >= 8 {
-                break;
-            }
-            let drone_bets = race_contract.get_drone_total_bets(game_id, drone_id);
-            if drone_bets > 0 {
-                let (bet_whole, bet_decimal) = format_balance(drone_bets.try_into().unwrap());
-                if drone_id == final_game.first_place {
-                    println!("Drone {} (1st): {}.{} STRK", drone_id, bet_whole, bet_decimal);
-                } else if drone_id == final_game.second_place {
-                    println!("Drone {} (2nd): {}.{} STRK", drone_id, bet_whole, bet_decimal);
-                } else if drone_id == final_game.third_place {
-                    println!("Drone {} (3rd): {}.{} STRK", drone_id, bet_whole, bet_decimal);
-                } else {
-                    println!("Drone {}: {}.{} STRK", drone_id, bet_whole, bet_decimal);
-                }
-            }
-            drone_id += 1;
-        };
-
-        // Add this after the existing game summary
-        println!("\n=== Final Admin Balance ===");
-        // let (init_admin_whole, init_admin_decimal) = format_balance(initial_admin_balance);
-        let (ls2, ls2_decimal) = format_balance(token.balance_of(admin));
-        // println!("Initial: {}.{} STRK", init_admin_whole, init_admin_decimal);
-        println!("Final: {}.{} STRK", ls2, ls2_decimal);
-        println!("Fee collected: {}.{} STRK", fee_whole, fee_decimal);
-
-        // Add final balance summary for all users
-        println!("\n=== Final Balance Summary ===");
-        println!("All Players Final Balances:");
-        let mut i: u32 = 0;
-        loop {
-            if i >= players.len() {
-                break;
-            }
-            let player = *players.at(i.try_into().unwrap());
-            let (player_whole, player_decimal) = format_balance(token.balance_of(player));
-            println!("Player {} final balance: {}.{} STRK", i, player_whole, player_decimal);
-            // let (initial_balance, post_bet, final_bal, _) = *player_balance_tracking.at(i.try_into().unwrap());
-            // let final_balance = token.balance_of(player);
-            // let net_change = final_balance - initial_balance.try_into().unwrap();
-            
-            // // let (init_whole, init_decimal) = format_balance(initial_balance.try_into().unwrap());
-            // let (final_whole, final_decimal) = format_balance(final_balance);
-            // let (change_whole, change_decimal) = format_balance(net_change);
-            
-            // // println!("  Initial: {}.{} STRK", init_whole, init_decimal);
-            // println!("  Final:   {}.{} STRK", final_whole, final_decimal);
-            // println!("  Change:  {}.{} STRK", change_whole, change_decimal);
-            
-            i += 1;
-        };
+        println!("1st place (Drone 0): {}.{} STRK (50%)", first_whole, first_decimal);
+        println!("2nd place (Drone 1): {}.{} STRK (30%)", second_whole, second_decimal);
+        println!("3rd place (Drone 2): {}.{} STRK (20%)", third_whole, third_decimal);
+        
+        // Undistributed rewards
+        let undistributed = race_contract.get_undistributed_rewards(game_id);
+        let (undist_whole, undist_decimal) = format_balance(undistributed.try_into().unwrap());
+        println!("\nUndistributed rewards: {}.{} STRK", undist_whole, undist_decimal);
+        
+        // Actually distributed
+        let distributed = remaining_pool - undistributed;
+        let (dist_whole, dist_decimal) = format_balance(distributed.try_into().unwrap());
+        println!("Actually distributed: {}.{} STRK", dist_whole, dist_decimal);
     }
 }

@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 starknet.workspace = true
 snforge_std = "0.35.0"
+openzeppelin = "0.20.0"
 erc20 = { path = "../erc20" }
 
 [dev-dependencies]
@@ -16,3 +17,11 @@ test.workspace = true
 
 [[target.starknet-contract]]
 build-external-contracts = ["erc20::token::erc20"]
+
+
+# starkli declare --account /Users/levien/account.json --keystore /Users/levien/keystore.json --network=sepolia target/dev/race_GameContract.contract_class.json 
+
+# starkli deploy --account /Users/levien/account.json --keystore /Users/levien/keystore.json --network=sepolia 0x02cb508383743f1b7b9ae3ffe1cee3194cb37568b0266a3b2f12e9c079ea1eb0 0x0609eb5630cf8fe3e34094175f93629264d97d827cea703661a5a6140bc64e7f 0x04718f5a0fc34cc1af16a1cdee98ffb20c31f5cd61d6ab07201858f4287c938d
+
+
+# starkli call --network=sepolia 0x061643ab9ae8a0a1ec2ba619d116b06f9019c18c93da730dbf5a560902eaaba6 "get_game" 0
